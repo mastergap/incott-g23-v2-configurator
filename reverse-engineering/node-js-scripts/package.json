@@ -1,0 +1,18 @@
+{
+  "name": "incott-mouse-tools",
+  "version": "1.0.0",
+  "description": "Cross-platform Incott G23V2SE mouse settings reader and writer",
+  "main": "monitor.js",
+  "type": "module",
+  "scripts": {
+    "start": "node monitor.js",
+    "monitor": "node monitor.js"
+  },
+  "keywords": ["incott", "mouse", "hid", "gaming"],
+  "dependencies": {
+    "node-hid": "^2.2.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
