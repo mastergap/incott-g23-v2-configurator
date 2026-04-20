@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "incott-g23-v2-configurator"
+version = "0.1.0"
+description = "Cross-platform TUI configurator for the Incott G23 V2 mouse"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+  { name = "Michele Ambrosi" }
+]
+dependencies = [
+  "textual>=0.61.1,<1.0.0",
+  "hidapi>=0.14.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "pytest-cov>=5.0.0",
+  "mypy>=1.10.0",
+  "ruff>=0.5.0"
+]
+
+[project.scripts]
+incott-configurator = "incott_configurator.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+mypy_path = "src"

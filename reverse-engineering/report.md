@@ -7,10 +7,10 @@
 ## 0. Connectivity Detection
 The software distinguishes between connection modes via the USB Product ID (PID):
 
-| Mode | Product ID (Hex) | Product ID (Dec) |
-| :--- | :--- | :--- |
-| **Wired** | `622c` | `25132` |
-| **Wireless** | `522c` | `21036` |
+| Mode         | Product ID (Hex) | Product ID (Dec) |
+| :----------- | :--------------- | :--------------- |
+| **Wired**    | `622c`           | `25132`          |
+| **Wireless** | `522c`           | `21036`          |
 
 **Detection Logic:** Applications should filter for Vendor ID `093a` and then check the PID to toggle UI elements (e.g., hiding battery status when wired, or showing a signal strength icon when wireless). The interface that sends the hearthbeat messages is the one with the higher number (usually 2).
 
@@ -23,17 +23,17 @@ The mouse broadcasts a 32-byte status message whenever its state changes or a sy
 
 ### 1.1 Byte-by-Byte Memory Map
 
-| Offset | Name | Type | Description |
-| :--- | :--- | :--- | :--- |
-| **0** | `Report ID` | `uint8` | Always `09`. |
-| **1** | `Battery` | `uint8` | Battery percentage (0-100 decimal). |
-| **2** | `Slot & Poll` | `bitfield` | High Nibble: **DPI Slot** | Low Nibble: **Polling Rate**. |
-| **3** | `Debounce` | `uint8` | Button debounce latency in milliseconds. |
-| **4** | `Reserved` | `uint8` | Usually `00`. |
-| **5** | `DPI LSB` | `uint8` | Low byte of calculated DPI value. |
-| **6** | `DPI MSB` | `uint8` | High byte of calculated DPI value. |
-| **7** | `Advanced` | `bitfield` | Sensor toggles (e.g., Motion Sync). |
-| **8-31**| `Padding` | `null` | Reserved for future firmware/macro expansion. |
+| Offset   | Name          | Type       | Description                                          |
+| :------- | :------------ | :--------- | :--------------------------------------------------- |
+| **0**    | `Report ID`   | `uint8`    | Always `09`.                                         |
+| **1**    | `Battery`     | `uint8`    | Battery percentage (0-100 decimal).                  |
+| **2**    | `Slot & Poll` | `bitfield` | High Nibble: **DPI Slot**                            | Low Nibble: **Polling Rate**.   |
+| **3**    | `Debounce`    | `uint8`    | Button debounce latency in milliseconds.             |
+| **4**    | `DPI Mult`    | `bitfield` | Low Nibble: X multiplier flag                        | High Nibble: Y multiplier flag. |
+| **5**    | `DPI X Raw`   | `uint8`    | Base X DPI value in 50-DPI increments (`+1` offset). |
+| **6**    | `DPI Y Raw`   | `uint8`    | Base Y DPI value in 50-DPI increments (`+1` offset). |
+| **7**    | `Advanced`    | `bitfield` | Sensor toggles (e.g., Motion Sync).                  |
+| **8-31** | `Padding`     | `null`     | Reserved for future firmware/macro expansion.        |
 
 ---
 
@@ -55,13 +55,17 @@ This byte must be masked to extract the two distinct settings:
     * `2`: 250 Hz
     * `3`: 125 Hz
 
-#### B. DPI Calculation (Bytes 5 & 6)
-The DPI is transmitted as a 16-bit Little Endian integer representing 50-DPI increments, with a `-1` offset.
+#### B. DPI Calculation (Bytes 4, 5, 6)
+The DPI for X and Y is calculated independently using byte 4 multiplier flags.
 
-**Formula:** $$DPI = (((MSB \ll 8) \mid LSB) + 1) \times 50$$
+* `mult_x = 5` if `(Byte4 & 0x0F) > 0`, else `1`
+* `mult_y = 5` if `(Byte4 >> 4) > 0`, else `1`
+* `dpi_x = (Byte5 + 1) * 50 * mult_x`
+* `dpi_y = (Byte6 + 1) * 50 * mult_y`
 
-**Example Parse:** Input: `0f 0f` (Lower values often mirror LSB in MSB placeholder)  
-Calculation: `(15 + 1) * 50 = 800 DPI`
+**Examples:**
+* `Byte4=00, Byte5=0f, Byte6=0f` -> `dpi_x=800, dpi_y=800`
+* `Byte4=11, Byte5=7f, Byte6=7f` -> `dpi_x=32000, dpi_y=32000`
 
 #### C. Sensor Flags (Byte 7)
 * `0x11`: Motion Sync **ON** / Default Performance.
@@ -82,17 +86,20 @@ def parse_heartbeat(data):
     poll_idx = (data[2] & 0x0F)
     
     debounce = data[3]
-    
-    # DPI Reconstruction
-    raw_dpi = (data[6] << 8) | data[5]
-    actual_dpi = (raw_dpi + 1) * 50
+
+    # DPI Reconstruction (per axis)
+    mult_x = 5 if (data[4] & 0x0F) > 0 else 1
+    mult_y = 5 if (data[4] >> 4) > 0 else 1
+    dpi_x = (data[5] + 1) * 50 * mult_x
+    dpi_y = (data[6] + 1) * 50 * mult_y
     
     return {
         "battery": battery,
         "slot": slot_idx + 1,
         "polling_hz": {0: 1000, 1: 500, 2: 250, 3: 125}.get(poll_idx),
         "debounce_ms": debounce,
-        "dpi": actual_dpi,
+        "dpi_x": dpi_x,
+        "dpi_y": dpi_y,
         "motion_sync": bool(data[7] & 0x01)
     }
 ```
@@ -105,25 +112,36 @@ Sent as 9-byte Feature Reports (ID `09`).
 To switch the active DPI slot without changing the values stored in them:
 **Structure:** `09 03 06 [Slot] 00 00 00 00 00`
 
-| Target | Hex [Slot] | Full Command |
-| :--- | :--- | :--- |
-| Slot 1 | `00` | `09 03 06 00 00 00 00 00 00` |
-| Slot 5 | `04` | `09 03 06 04 00 00 00 00 00` |
+| Target | Hex [Slot] | Full Command                 |
+| :----- | :--------- | :--------------------------- |
+| Slot 1 | `00`       | `09 03 06 00 00 00 00 00 00` |
+| Slot 5 | `04`       | `09 03 06 04 00 00 00 00 00` |
 
 ### B. DPI Value Configuration (Slot Overwrite)
-**Structure:** `09 02 [SlotIndex] [LSB] [MSB] 00 00 00 00`
-*Note: SlotIndex for writing values starts at `01`.*
+**Confirmed Structure (from official app capture):**
+`09 02 [SlotIndex0] [LSB] [MSB] 00 00 00 [Axis]`
 
-| Target | Hex [Index] | Example: Set to 32,000 DPI (`7f 02`) |
-| :--- | :--- | :--- |
-| Slot 1 | `01` | `09 02 01 7f 02 00 00 00 00` |
-| Slot 5 | `05` | `09 02 05 7f 02 00 00 00 00` |
+* `SlotIndex0` is **zero-based** (`00` = Slot 1, `05` = Slot 6).
+* `Axis` selector:
+    * `00`: write both X and Y to the same DPI value
+    * `01`: write only X axis DPI
+    * `02`: write only Y axis DPI
+
+**Captured Examples**
+
+| Scenario                   | Packet                       |
+| :------------------------- | :--------------------------- |
+| Slot 6, 500 DPI both X/Y   | `09 02 05 09 00 00 00 00 00` |
+| Slot 6, 32000 DPI both X/Y | `09 02 05 7f 02 00 00 00 00` |
+| Slot 5, 32000 DPI X only   | `09 02 04 7f 02 00 00 00 01` |
+| Slot 5, 600 DPI Y only     | `09 02 04 0b 00 00 00 00 02` |
 
 ### C. Polling Rate
 **Structure:** `09 01 [Value] 00 00 00 00 00 00`
 * `00`: 1000 Hz
 * `01`: 500 Hz
 * `02`: 250 Hz
+* `03`: 125 Hz
 
 ### D. Hardware Latency & Sensors
 **Structure:** `09 05 [Sub-ID] [Value] 00 00 00 00 00`
