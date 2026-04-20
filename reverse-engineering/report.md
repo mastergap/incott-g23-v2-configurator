@@ -146,6 +146,7 @@ To switch the active DPI slot without changing the values stored in them:
 ### D. Hardware Latency & Sensors
 **Structure:** `09 05 [Sub-ID] [Value] 00 00 00 00 00`
 * **Debounce (Sub `01`):** `09 05 01 [ms] 00 00 00 00 00`
+* **Performance mode (???):** `???`
 * **Sleep (Sub `03`):** `09 05 03 [secs] 00 00 00 00 00`
 * **LOD (Action `04`):** `09 04 01 [01/02] 00 00 00 00 00`
 
