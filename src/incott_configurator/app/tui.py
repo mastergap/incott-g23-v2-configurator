@@ -38,6 +38,7 @@ from incott_configurator.protocol.commands import (
 )
 from incott_configurator.service.local_settings import LocalSettingsState, LocalSettingsStore
 from incott_configurator.service.session import SessionManager
+import time
 
 _DEFAULT_SLOT_DPI_VALUES: dict[int, tuple[int, int]] = {
     1: (400, 400),
@@ -209,11 +210,13 @@ class IncottConfiguratorApp(App[None]):
         self._current_slot_initialized = False
         self._last_hydrated_slot: int | None = None
         self._current_slot_pending: int | None = None
+        self._current_slot_pending_at: float | None = None
         self._polling_pending: PollingRate | None = None
         self._current_slot_dirty = False
         self._polling_dirty = False
         self._dpi_edit_dirty = False
         self._dpi_pending: tuple[int, int, int] | None = None
+        self._lod_dirty = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -306,6 +309,22 @@ class IncottConfiguratorApp(App[None]):
         bar = self.query_one("#status-bar", Static)
         widget = self.query_one("#current-settings", CurrentSettingsWidget)
 
+        # `SessionManager.snapshot()` may return None until the first
+        # valid heartbeat is received; guard against that here.
+        import logging
+        _logger = logging.getLogger(__name__)
+        if snap is None:
+            _logger.debug("tui: snapshot is None (no heartbeat yet)")
+            bar.update("Connecting...")
+            widget.refresh_from_snapshot(
+                False,
+                None,
+                None,
+                self._persisted_lod_level,
+                self._persisted_sleep_timeout_seconds,
+            )
+            return
+
         if not snap.connected:
             bar.update(f"Disconnected — {snap.last_error or 'searching...'}")
             widget.refresh_from_snapshot(
@@ -329,6 +348,7 @@ class IncottConfiguratorApp(App[None]):
             return
 
         st = snap.status
+        _logger.info("tui: received snapshot — slot=%s battery=%s", st.slot_index + 1, st.battery_percent)
         self._slot_dpi_values[st.slot_index + 1] = (st.dpi_x, st.dpi_y)
         self._hydrate_controls_from_status(st)
 
@@ -354,14 +374,29 @@ class IncottConfiguratorApp(App[None]):
             return
 
         current_slot_select = self.query_one("#select-current-slot", Select)
-        if not self._current_slot_initialized:
-            current_slot_select.value = status.slot_index + 1
-            self._current_slot_initialized = True
-        elif self._current_slot_pending is not None:
+        # Handle pending slot switches first so a device confirmation clears
+        # the pending state even if the UI hasn't completed initial hydration.
+        if self._current_slot_pending is not None:
             if status.slot_index + 1 == self._current_slot_pending:
+                # Device confirmed the switch
                 self._current_slot_pending = None
                 self._current_slot_dirty = False
-            # Keep user-selected value while waiting for device acknowledgement.
+                if current_slot_select.value != status.slot_index + 1:
+                    current_slot_select.value = status.slot_index + 1
+            else:
+                # If pending switch timed out, clear pending and honor device state.
+                if (
+                    self._current_slot_pending_at is not None
+                    and time.monotonic() - self._current_slot_pending_at > 5.0
+                ):
+                    self._current_slot_pending = None
+                    self._current_slot_dirty = False
+                    if current_slot_select.value != status.slot_index + 1:
+                        current_slot_select.value = status.slot_index + 1
+                # Otherwise keep user-selected value while waiting for device acknowledgement.
+        elif not self._current_slot_initialized:
+            current_slot_select.value = status.slot_index + 1
+            self._current_slot_initialized = True
         elif self._current_slot_dirty:
             # Keep unsaved user selection.
             pass
@@ -387,7 +422,12 @@ class IncottConfiguratorApp(App[None]):
                 debounce_input.value = debounce_value
 
         lod_select = self.query_one("#select-lod", Select)
-        if self._persisted_lod_level is not None and lod_select.value != self._persisted_lod_level:
+        # If the user has an unsaved change, do not overwrite the select
+        # from heartbeat updates.
+        if self._lod_dirty:
+            # user is editing LOD locally; do not overwrite
+            pass
+        elif self._persisted_lod_level is not None and lod_select.value != self._persisted_lod_level:
             lod_select.value = self._persisted_lod_level
 
         sleep_input = self.query_one("#input-sleep", Input)
@@ -436,38 +476,54 @@ class IncottConfiguratorApp(App[None]):
                 dpi_y_input.value = dpi_y_value
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "select-current-slot":
-            if event.value is not Select.BLANK:
-                self._current_slot_initialized = True
-                snapshot = self._session.snapshot()
-                if snapshot.status is not None and isinstance(event.value, int):
-                    self._current_slot_dirty = (event.value != snapshot.status.slot_index + 1)
-                else:
-                    self._current_slot_dirty = True
+        sel_id = event.select.id
+        val = event.value
+
+        if sel_id == "select-current-slot":
+            if val is Select.BLANK:
+                return
+            # Mark that the user has interacted with the current-slot control.
+            self._current_slot_initialized = True
+            snapshot = self._session.snapshot()
+            if snapshot is not None and snapshot.status is not None and isinstance(val, int):
+                self._current_slot_dirty = (val != snapshot.status.slot_index + 1)
+            else:
+                # No device snapshot yet; allow the upcoming heartbeat to
+                # initialize the control rather than treating this as a dirty edit.
+                self._current_slot_dirty = False
             return
 
-        if event.select.id == "select-polling":
-            if event.value is not Select.BLANK:
-                snapshot = self._session.snapshot()
-                if snapshot.status is not None and isinstance(event.value, int):
-                    self._polling_dirty = (event.value != int(snapshot.status.polling))
-                else:
-                    self._polling_dirty = True
+        if sel_id == "select-polling":
+            if val is Select.BLANK:
+                return
+            snapshot = self._session.snapshot()
+            if snapshot is not None and snapshot.status is not None and isinstance(val, int):
+                self._polling_dirty = (val != int(snapshot.status.polling))
+            else:
+                self._polling_dirty = False
             return
 
-        if event.select.id != "select-edit-slot":
+        if sel_id == "select-lod":
+            if val is Select.BLANK:
+                return
+            # Mark LOD as locally dirty so it isn't overwritten by heartbeats
+            try:
+                v = int(val)  # type: ignore[arg-type]
+                self._lod_dirty = (self._persisted_lod_level is None or v != self._persisted_lod_level)
+            except Exception:
+                self._lod_dirty = True
             return
 
-        if event.value is Select.BLANK:
+        if sel_id == "select-edit-slot":
+            if val is Select.BLANK:
+                return
+            if not isinstance(val, int):
+                return
+            slot = val
+            self._sync_slot_dpi_inputs(slot)
+            self._last_hydrated_slot = slot
+            self._dpi_edit_dirty = False
             return
-
-        if not isinstance(event.value, int):
-            return
-
-        slot = event.value
-        self._sync_slot_dpi_inputs(slot)
-        self._last_hydrated_slot = slot
-        self._dpi_edit_dirty = False
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id in {"input-dpi-x", "input-dpi-y"}:
@@ -567,6 +623,7 @@ class IncottConfiguratorApp(App[None]):
             errors.append(f"Debounce: {exc}")
 
         lod_raw = self.query_one("#select-lod", Select).value
+        lod_applied = False
         if lod_raw is not Select.BLANK:
             try:
                 lod_level = LodLevel(int(lod_raw))  # type: ignore[arg-type]
@@ -574,8 +631,13 @@ class IncottConfiguratorApp(App[None]):
                 should_persist_local_settings = True
                 self._session.apply_command(build_set_lod(lod_level))
                 any_command_sent = True
+                lod_applied = True
             except (ValueError, TypeError) as exc:
                 errors.append(f"LOD: {exc}")
+
+        # Clear only the LOD dirty flag when LOD was actually applied.
+        if lod_applied:
+            self._lod_dirty = False
 
         try:
             sleep_s = validate_sleep_seconds(int(self.query_one("#input-sleep", Input).value))

@@ -6,6 +6,9 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
+import logging
+
+_LOGGER = logging.getLogger(__name__)
 
 from incott_configurator.constants import HEARTBEAT_MIN_LENGTH
 from incott_configurator.domain.models import AppSnapshot, HeartbeatStatus
@@ -33,6 +36,7 @@ class SessionManager:
         ),
         init=False,
     )
+    _has_valid_snapshot: bool = field(default=False, init=False)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -48,8 +52,15 @@ class SessionManager:
             self._thread.join(timeout=2)
         self.transport.close()
 
-    def snapshot(self) -> AppSnapshot:
+    def snapshot(self) -> AppSnapshot | None:
+        """Return the last AppSnapshot, or `None` until a first valid heartbeat is received.
+
+        This avoids exposing a default snapshot to the UI before the device reports
+        its real state via heartbeat.
+        """
         with self._snapshot_lock:
+            if not self._has_valid_snapshot:
+                return None
             return self._snapshot
 
     def apply_command(self, command: bytes) -> None:
@@ -107,6 +118,7 @@ class SessionManager:
                 status=self._snapshot.status,
                 last_error=None,
             )
+            _LOGGER.info("session: device connected, mode=%s", mode)
 
     def _set_status(self, status: HeartbeatStatus) -> None:
         with self._snapshot_lock:
@@ -116,6 +128,10 @@ class SessionManager:
                 status=status,
                 last_error=None,
             )
+            # Mark that we've now seen a valid heartbeat-derived snapshot.
+            self._has_valid_snapshot = True
+            _LOGGER.info("session: heartbeat status updated: slot=%s dpi=%s,%s battery=%s",
+                         status.slot_index + 1, status.dpi_x, status.dpi_y, status.battery_percent)
 
     def _set_error(self, message: str) -> None:
         with self._snapshot_lock:

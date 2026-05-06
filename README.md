@@ -162,3 +162,93 @@ Output binary is created in `dist/`.
 
 - Reverse-engineering scripts are reference/test-vector material only.
 - Production code does not import runtime logic from reverse-engineering scripts.
+
+## Software Architecture
+
+Overview
+
+- This application follows a small, layered architecture focused on separation of concerns and testability. The main runtime pieces are:
+  - `main` — application entrypoint that wires the transport, session manager, and TUI.
+  - `transport` — platform-specific device access (hidapi adapter).
+  - `service` — session manager: device discovery, read loop, command queue, and snapshot of device state.
+  - `protocol` — packet builders/parsers for feature reports and heartbeat decoding.
+  - `domain` — typed models and validation logic used across layers.
+  - `app` — Textual TUI that renders `SessionManager` snapshots and enqueues write commands.
+
+Packages and responsibilities
+
+- `src/incott_configurator/main.py` — Boots the app: constructs `HidApiAdapter`, `SessionManager`, and `IncottConfiguratorApp`, starts the session background thread, and runs the TUI.
+- `src/incott_configurator/transport/` — Transport abstraction and concrete adapters. The production adapter is `hidapi_adapter.py` which encapsulates `hid` usage and exposes a minimal `HidTransport` API (`find_management_device`, `open`, `read`, `send_feature_report`, `close`). Keep this layer thin so tests can inject fakes.
+- `src/incott_configurator/service/session.py` — Central coordination component. Responsibilities:
+  - Device discovery and lifecycle (open/close).
+  - Background read loop (daemon thread) which reads packets, parses heartbeats, and maintains an `AppSnapshot`.
+  - A simple, thread-safe command queue (`apply_command`) used by the UI to enqueue write requests.
+  - Periodic sync requests to refresh device state.
+- `src/incott_configurator/protocol/` — Encoders/decoders for feature reports and heartbeat parsing. Use these functions to build write commands and to interpret incoming packets into `domain` models.
+- `src/incott_configurator/domain/` — Immutable dataclasses and enums (e.g. `HeartbeatStatus`, `AppSnapshot`, `PollingRate`) and validation helpers. The domain layer is the translation boundary between raw bytes and app semantics.
+- `src/incott_configurator/app/` — Textual UI. It polls `SessionManager.snapshot()` on a timer (UI thread) and updates widgets. User actions call `SessionManager.apply_command()` with protocol-built feature reports.
+
+Runtime flow (high level)
+
+1. `main` constructs `HidApiAdapter` and `SessionManager`, then starts the session thread.
+2. `SessionManager._run` discovers the device and opens the transport.
+3. The session thread repeatedly:
+   - Drains the command queue and sends feature reports via `transport.send_feature_report()`.
+   - Periodically sends a sync request (`build_sync_request()`) to elicit a heartbeat.
+   - Reads incoming packets with `transport.read()` and, if valid, parses heartbeats into a `HeartbeatStatus` which is stored in an `AppSnapshot` guarded by a lock.
+4. The TUI runs on the main thread and periodically calls `SessionManager.snapshot()` to get the latest snapshot and render UI state. User interactions enqueue write commands and may persist local preferences.
+
+Concurrency and error handling
+
+- The session uses a dedicated daemon thread so the TUI remains responsive. Inter-thread communication is intentionally simple:
+  - Commands: `queue.SimpleQueue` (non-blocking puts by UI, drained by session thread).
+  - Snapshot: protected by a `threading.Lock` to return a consistent `AppSnapshot` to the UI.
+- Transport-level errors and parse errors are logged; malformed packets are ignored to keep the session alive. On unrecoverable errors the session sets an error snapshot and closes the transport.
+
+Design choices and rationale
+
+- Thin transport adapter: keeps `SessionManager` and protocol code testable by isolating `hid` usage.
+- Queue-based write model: avoids blocking the UI while writes are performed by the session thread.
+- Heartbeat-driven state: the device is the source of truth for most runtime state, UI shows local cached values for settings that are persisted locally until device confirmation.
+- Explicit validation in `domain.validation`: prevents generating invalid reports and surfaces helpful errors to the UI.
+
+Extensibility and contribution notes
+
+- Adding new commands: implement encoders in `src/incott_configurator/protocol/commands.py`, add validation helpers in `src/incott_configurator/domain/validation.py`, and expose required UI controls in `src/incott_configurator/app/tui.py`.
+- Adding a transport: subclass `HidTransport` and implement the minimal API. Tests should inject the transport into `SessionManager` to simulate devices.
+- Tests: unit tests live in `tests/` and focus on protocol encoders/parsers, session behavior, and UI hydration. Keep network/device I/O out of unit tests by mocking the transport.
+
+Where to look first when contributing
+
+- Device I/O and session management: [src/incott_configurator/service/session.py](src/incott_configurator/service/session.py#L1-L200)
+- Transport adapter (hidapi): [src/incott_configurator/transport/hidapi_adapter.py](src/incott_configurator/transport/hidapi_adapter.py#L1-L200)
+- Protocol encoders: [src/incott_configurator/protocol/commands.py](src/incott_configurator/protocol/commands.py#L1-L200)
+- Heartbeat parsing: [src/incott_configurator/protocol/heartbeat.py](src/incott_configurator/protocol/heartbeat.py#L1-L200)
+- TUI interactions and state hydration: [src/incott_configurator/app/tui.py](src/incott_configurator/app/tui.py#L1-L200)
+
+**Sequence Diagram**
+```mermaid
+sequenceDiagram
+  participant TUI
+  participant SessionManager
+  participant Protocol
+  participant Transport
+  participant Device
+
+  TUI->>SessionManager: apply_command(cmd)
+  SessionManager->>Protocol: build_feature_report(cmd)
+  Protocol->>Transport: send_feature_report(bytes)
+  Transport->>Device: HID write(bytes)
+
+  Device-->>Transport: HID report (bytes)
+  Transport-->>SessionManager: read(bytes)
+  SessionManager->>Protocol: parse_heartbeat(bytes)
+  Protocol-->>SessionManager: HeartbeatStatus
+  SessionManager-->>TUI: publish snapshot (locked)
+  TUI->>TUI: render UI (poll timer)
+```
+Notes:
+- The session thread performs all blocking I/O and applies queued commands.
+- The TUI only calls `SessionManager.apply_command()` and `SessionManager.snapshot()`.
+- `Protocol` functions (encoders/parsers) convert between bytes and `domain` models.
+```

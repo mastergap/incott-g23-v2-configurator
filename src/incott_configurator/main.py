@@ -8,6 +8,9 @@ from incott_configurator.transport.hidapi_adapter import HidApiAdapter
 
 
 def main() -> None:
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
     transport = HidApiAdapter()
     session = SessionManager(transport=transport)
     session.start()
